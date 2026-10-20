@@ -1,0 +1,10 @@
+telegram.json
+settings.json
+bot.log
+bot.pid
+__pycache__/
+_internal/
+ffmpeg/
+*.exe
+*.lnk
+.env
