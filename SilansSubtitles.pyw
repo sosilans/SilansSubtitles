@@ -107,6 +107,7 @@ UI = {
         "video_fail": "Не удалось скачать видео.",
         "file_missing": "Файл не появился. Попробуйте другое качество.",
         "file_busy": "Файл был занят другим скачиванием.",
+        "net_fail": "Нет связи с сервером видео. Очередь идёт дальше.",
         "av": "видео и звук",
         "audio_only": "только звук",
         "audio_code": "звук",
@@ -175,6 +176,7 @@ UI = {
         "video_fail": "Could not download the video.",
         "file_missing": "The file did not appear. Try another quality.",
         "file_busy": "The file was still in use by another download.",
+        "net_fail": "The video server did not answer. The queue continues.",
         "av": "video and audio",
         "audio_only": "audio only",
         "audio_code": "audio",
@@ -704,6 +706,18 @@ def _subtitle_url(formats):
         return ""
     ranked.sort(key=lambda item: item[0])
     return ranked[0][1]
+
+
+def _network_blip(error):
+    text = str(error).lower()
+    return any(mark in text for mark in (
+        "getaddrinfo",
+        "failed to resolve",
+        "errno 11001",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+    ))
 
 
 def _file_in_use(error):
@@ -1341,6 +1355,11 @@ def download_media(url, item, destination, progress=None, cancel=None):
                 continue
             if _file_in_use(error):
                 raise ValueError(tr("file_busy")) from error
+            if _network_blip(error) and attempt < 2:
+                sleep_cancel(4, cancel)
+                continue
+            if _network_blip(error):
+                raise ValueError(tr("net_fail")) from error
             if "429" not in str(error) or attempt == 5:
                 if "429" in str(error):
                     raise ValueError(tr("rate_limit")) from error
@@ -2030,11 +2049,13 @@ class App(TkinterDnD.Tk if TkinterDnD else tk.Tk):
     def _show_video_formats(self):
         self._show_choice("_video_format_popup", self.video_format_button, VIDEO_FORMATS, self._pick_video_format)
 
-    def _poke_sky(self, _event=None):
+    def _poke_sky(self, _event=None, force=False):
+        if force:
+            self._mask_force = True
         job = getattr(self, "_sky_mask_job", None)
         if job:
             self.after_cancel(job)
-        self._sky_mask_job = self.after(200, self._sync_sky_mask)
+        self._sky_mask_job = self.after(40 if force else 200, self._sync_sky_mask)
 
     def _sky_keep(self, widget):
         kind = widget.winfo_class()
@@ -2074,9 +2095,12 @@ class App(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         if frame is None or not frame.winfo_exists() or frame.winfo_width() < 80:
             return
         size = (frame.winfo_width(), frame.winfo_height())
-        if size == getattr(self, "_mask_size", None):
+        force = getattr(self, "_mask_force", False)
+        self._mask_force = False
+        if not force and size == getattr(self, "_mask_size", None):
             return
         self._mask_size = size
+        frame.update_idletasks()
         origin = (frame.winfo_rootx(), frame.winfo_rooty())
         rects = []
         for child in frame.winfo_children():
@@ -2726,7 +2750,10 @@ class App(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             if button:
                 button.configure(text=tr("done"), state="disabled", fg="#86efac")
         else:
-            job["text"].set(f"{name}  —  {detail or tr('error')}")
+            short = detail or tr("error")
+            if len(short) > 90:
+                short = short[:87] + "…"
+            job["text"].set(f"{name}  —  {short}")
             if button:
                 button.configure(text=tr("error"), state="disabled", fg="#fda4af")
 
@@ -2740,13 +2767,6 @@ class App(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
     def _queue_resized(self, event):
         self.queue_canvas.itemconfigure(self.queue_window, width=event.width)
-        wrap = max(160, event.width - 120)
-        if self.queue_empty.winfo_exists():
-            self.queue_empty.configure(wraplength=wrap)
-        for job in self.jobs:
-            label = job.get("label")
-            if label is not None and label.winfo_exists():
-                label.configure(wraplength=wrap)
         self._fit_queue()
 
     def _fit_queue(self):
@@ -2763,7 +2783,7 @@ class App(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             self.queue_scroll.grid(row=0, column=1, sticky="ns")
         else:
             self.queue_scroll.grid_remove()
-        self._poke_sky()
+        self._poke_sky(force=True)
 
     def _scroll_job(self, job):
         line = job.get("line")
@@ -2799,7 +2819,6 @@ class App(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             font=("Segoe UI", 9),
             anchor="w",
             justify="left",
-            wraplength=max(160, self.queue_canvas.winfo_width() - 120),
         )
         label.pack(side="left", fill="x", expand=True, padx=(4, 8))
         job["label"] = label
@@ -2821,6 +2840,7 @@ class App(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         button.pack(side="right", padx=4, pady=2)
         job["button"] = button
         job["line"] = line
+        self._bind_queue_wheel(self.queue_canvas.master)
         self._bind_queue_wheel(line)
         self._bind_queue_wheel(label)
         self._bind_queue_wheel(button)
@@ -2891,27 +2911,30 @@ class App(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self.after(0, lambda current=job, name=saved: self._finish_job(current, "done", name))
 
     def _finish_job(self, job, state, detail=""):
-        if job["state"] in {"done", "cancelled", "error"}:
-            return
-        job["state"] = state
-        job["detail"] = detail
-        self._refresh_job(job)
-        if state == "done":
-            self.say("saved", "#86efac", name=detail)
-            self._report("download", host=site_host(job.get("url")), kind=job["row"].get("type"))
-        elif state == "error":
-            self.status_key = None
-            self.status_args = {}
-            self.status_label.configure(fg="#fda4af")
-            self.status.set(detail)
-            self._report(
-                "error",
-                where="download",
-                host=site_host(job.get("url")),
-                kind=job["row"].get("type"),
-                text=str(detail)[:500],
-            )
-        self._start_queue()
+        try:
+            if job["state"] in {"done", "cancelled", "error"}:
+                return
+            job["state"] = state
+            job["detail"] = detail
+            self._refresh_job(job)
+            if state == "done":
+                self.say("saved", "#86efac", name=detail)
+                self._report("download", host=site_host(job.get("url")), kind=job["row"].get("type"))
+            elif state == "error":
+                shown = detail if len(detail) <= 140 else tr("net_fail") if _network_blip(detail) else detail[:137] + "…"
+                self.status_key = None
+                self.status_args = {}
+                self.status_label.configure(fg="#fda4af")
+                self.status.set(shown)
+                self._report(
+                    "error",
+                    where="download",
+                    host=site_host(job.get("url")),
+                    kind=job["row"].get("type"),
+                    text=str(detail)[:500],
+                )
+        finally:
+            self._start_queue()
 
     def open_folder(self):
         folder = self.save_dir if self.save_dir.is_dir() else Path.home()
