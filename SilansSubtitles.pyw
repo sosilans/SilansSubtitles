@@ -108,6 +108,7 @@ UI = {
         "file_missing": "Файл не появился. Попробуйте другое качество.",
         "file_busy": "Файл был занят другим скачиванием.",
         "net_fail": "Нет связи с сервером видео. Очередь идёт дальше.",
+        "no_audio": "Видео скачалось без звука. Попробуйте ещё раз.",
         "av": "видео и звук",
         "audio_only": "только звук",
         "audio_code": "звук",
@@ -177,6 +178,7 @@ UI = {
         "file_missing": "The file did not appear. Try another quality.",
         "file_busy": "The file was still in use by another download.",
         "net_fail": "The video server did not answer. The queue continues.",
+        "no_audio": "The video downloaded without audio. Try again.",
         "av": "video and audio",
         "audio_only": "audio only",
         "audio_code": "audio",
@@ -856,15 +858,24 @@ def collect_media(info):
             code = f"{int(height)}p" + (str(int(fps)) if fps >= 50 else "")
         else:
             code = "MP4" if note_key else str(item.get("format_id") or ext).upper()[:18]
+        has_audio = item.get("acodec") not in (None, "none")
+        has_video = item.get("vcodec") not in (None, "none")
+        format_id = item.get("format_id") or "best"
+        if has_video and not has_audio and not hls:
+            selector = f"{format_id}+ba[ext=m4a]/{format_id}+ba"
+            merged = True
+        else:
+            selector = format_id
+            merged = hls
         row = {
             "type": "video",
             "code": code,
             "name": note or str(ext).upper(),
             "detail": "",
             "bytes": bytes_of(item),
-            "selector": item.get("format_id") or "best",
+            "selector": selector,
             "ext": ext,
-            "merged": hls,
+            "merged": merged,
             "_pref": item.get("preference") or 0,
         }
         if note_key:
@@ -873,56 +884,53 @@ def collect_media(info):
         if item.get("format_id"):
             used_ids.add(item.get("format_id"))
 
-    heights = sorted(
-        {
-            item.get("height")
-            for item in formats
-            if item.get("height") and item.get("vcodec") not in (None, "none")
-        },
-        reverse=True,
-    )
-    for height in heights:
-        group = [
-            item for item in formats
-            if item.get("height") == height and item.get("vcodec") not in (None, "none")
-        ]
-        notes = {item.get("format_note") or "" for item in group}
-        if len(notes) > 1 and any(notes):
-            for item in group:
-                if item.get("vcodec") == "none":
-                    continue
-                add_direct(item)
+    def stream_key(item):
+        note = item.get("format_note") or ""
+        special = {
+            "Camera stream": "cam",
+            "Screen share stream": "screen",
+            "Screen share with camera": "screen_cam",
+        }.get(note, "")
+        fps = item.get("fps") or 0
+        rate = str(int(fps)) if fps >= 50 else ""
+        return (int(item.get("height") or 0), special, rate)
+
+    grouped = {}
+    for item in formats:
+        if not item.get("height") or item.get("vcodec") in (None, "none"):
+            continue
+        grouped.setdefault(stream_key(item), []).append(item)
+
+    for (height, special, rate), group in sorted(grouped.items(), key=lambda pair: (-pair[0][0], pair[0][2])):
+        if special:
+            chosen = max(group, key=lambda item: (item.get("tbr") or 0, bytes_of(item)))
+            add_direct(chosen)
+            used_ids.update(item.get("format_id") for item in group)
             continue
         mp4 = [item for item in group if item.get("ext") == "mp4"]
         pool = mp4 or group
-        ext = pool[0].get("ext") or "mp4"
         progressive = [item for item in pool if item.get("acodec") not in (None, "none")]
-        fps = max((item.get("fps") or 0) for item in pool)
-        quality = f"{int(height)}p" + (str(int(fps)) if fps and fps >= 50 else "")
+        quality = f"{height}p{rate}"
         if progressive:
             best = max(progressive, key=lambda item: item.get("tbr") or 0)
             selector = best["format_id"]
             size = bytes_of(best)
             merged = False
-            ext = best.get("ext") or ext
-            used_ids.add(best.get("format_id"))
+            ext = best.get("ext") or "mp4"
         else:
-            selector = (
-                f"bv*[height={int(height)}][ext={ext}]+ba[ext=m4a]/"
-                f"bv*[height={int(height)}]+ba/b[height={int(height)}]"
-            )
-            video_size = max(bytes_of(item) for item in pool)
+            best = max(pool, key=lambda item: item.get("tbr") or 0)
+            format_id = best.get("format_id") or "bv"
+            selector = f"{format_id}+ba[ext=m4a]/{format_id}+ba"
             audios = [
                 item for item in formats
                 if item.get("vcodec") in (None, "none")
                 and item.get("acodec") not in (None, "none")
                 and item.get("ext") in {"m4a", "mp4"}
             ]
-            size = video_size + max((bytes_of(item) for item in audios), default=0)
+            size = bytes_of(best) + max((bytes_of(item) for item in audios), default=0)
             merged = True
-            if ext == "mp4":
-                ext = "mp4"
-            used_ids.update(item.get("format_id") for item in pool)
+            ext = "mp4"
+        used_ids.update(item.get("format_id") for item in group)
         options.append({
             "type": "video",
             "code": quality,
@@ -1037,6 +1045,52 @@ def ffmpeg_location():
     if (app_dir() / "ffmpeg.exe").exists():
         return str(app_dir())
     return None
+
+
+def ffmpeg_exe():
+    folder = ffmpeg_location()
+    if not folder:
+        return None
+    path = Path(folder) / "ffmpeg.exe"
+    if path.exists():
+        return path
+    path = Path(folder)
+    return path if path.suffix.lower() == ".exe" and path.exists() else None
+
+
+def media_tracks(path):
+    exe = ffmpeg_exe()
+    if exe is None:
+        return True, True
+    probe = subprocess.run(
+        [str(exe), "-hide_banner", "-i", str(path)],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    text = probe.stderr or ""
+    return "Video:" in text, "Audio:" in text
+
+
+def merge_audio_video(video, audio, destination):
+    exe = ffmpeg_exe()
+    if exe is None:
+        raise ValueError(tr("need_ffmpeg"))
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(exe), "-y", "-i", str(video), "-i", str(audio),
+        "-map", "0:v:0", "-map", "1:a:0", "-movflags", "+faststart",
+    ]
+    copied = subprocess.run(command + ["-c", "copy", str(destination)], capture_output=True)
+    if copied.returncode != 0:
+        encoded = subprocess.run(
+            command + ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(destination)],
+            capture_output=True,
+        )
+        if encoded.returncode != 0:
+            raise ValueError(tr("no_audio"))
+    return destination
 
 
 def clock_ms(hours, minutes, seconds, millis):
@@ -1376,9 +1430,12 @@ def download_media_once(url, item, destination, progress=None, cancel=None):
     with tempfile.TemporaryDirectory(prefix="silans-media-", ignore_cleanup_errors=True) as temp_dir:
         temp_root = Path(temp_dir)
         options = apply_password(base_options())
+        selector = item["selector"]
+        if item.get("type") == "video" and "+" not in selector:
+            selector = f"{selector}+ba[ext=m4a]/{selector}+ba/{selector}"
         options.update({
             "skip_download": False,
-            "format": item["selector"],
+            "format": selector,
             "outtmpl": str(temp_root / "%(id)s.%(format_id)s.%(ext)s"),
             "retries": 3,
             "fragment_retries": 3,
@@ -1417,8 +1474,25 @@ def download_media_once(url, item, destination, progress=None, cancel=None):
         preferred = [path for path in created if path.suffix.lower() == f".{ext}"]
         if not preferred and not created:
             raise ValueError(tr("file_missing"))
-        chosen = max(preferred or created, key=lambda path: path.stat().st_size)
-        shutil.copyfile(chosen, destination)
+        if item.get("type") == "video":
+            tracks = [(path, media_tracks(path)) for path in created]
+            complete = [path for path, (video, audio) in tracks if video and audio]
+            if complete:
+                chosen = max(complete, key=lambda path: path.stat().st_size)
+                shutil.copyfile(chosen, destination)
+            else:
+                videos = [path for path, (video, audio) in tracks if video and not audio]
+                audios = [path for path, (video, audio) in tracks if audio and not video]
+                if not videos or not audios:
+                    raise ValueError(tr("no_audio"))
+                video = max(videos, key=lambda path: path.stat().st_size)
+                audio = max(audios, key=lambda path: path.stat().st_size)
+                merge_audio_video(video, audio, destination)
+                if not media_tracks(destination)[1]:
+                    raise ValueError(tr("no_audio"))
+        else:
+            chosen = max(preferred or created, key=lambda path: path.stat().st_size)
+            shutil.copyfile(chosen, destination)
     if is_youtube(url):
         mark_rate_limit(18)
     return destination
